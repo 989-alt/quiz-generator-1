@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 퀴즈 생성기 (GitHub Pages 버전)</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <style>
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .container { max-width: 800px; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        .loading { display: none; text-align: center; margin: 20px 0; }
+        .quiz-card { border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-bottom: 20px; background-color: #fff; }
+        .answer-box { display: none; margin-top: 15px; padding: 15px; background-color: #e8f5e9; border-radius: 5px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2 class="text-center mb-4"><i class="bi bi-robot"></i> AI 수업 자료 퀴즈 생성기</h2>
+    
+    <div class="card p-3 mb-4 bg-light">
+        <h5>1. 설정</h5>
+        <div class="mb-3">
+            <label class="form-label">Gemini API Key</label>
+            <input type="password" id="apiKey" class="form-control" placeholder="AI Studio에서 발급받은 키 입력">
+        </div>
+        <div class="mb-3">
+            <label class="form-label">수업 자료 업로드 (PDF, PPTX, TXT)</label>
+            <input type="file" id="fileInput" class="form-control" accept=".pdf, .pptx, .txt">
+        </div>
+        <button onclick="startProcess()" class="btn btn-primary w-100">
+            <i class="bi bi-stars"></i> 퀴즈 생성하기
+        </button>
+    </div>
+
+    <div id="loading" class="loading">
+        <div class="spinner-border text-primary" role="status"></div>
+        <p class="mt-2" id="loadingText">문서를 분석하고 있습니다...</p>
+    </div>
+
+    <div id="resultArea" style="display: none;">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h4>Generated Quiz</h4>
+            <button onclick="downloadCSV()" class="btn btn-success btn-sm">
+                <i class="bi bi-file-earmark-excel"></i> CSV 다운로드
+            </button>
+        </div>
+        <div id="quizList"></div>
+    </div>
+</div>
+
+<script>
+    // PDF.js 워커 설정
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    let globalQuizData = [];
+    let extractedText = "";
+
+    // 메인 실행 함수
+    async function startProcess() {
+        const apiKey = document.getElementById('apiKey').value;
+        const fileInput = document.getElementById('fileInput').files[0];
+
+        if (!apiKey) return alert("API Key를 입력해주세요.");
+        if (!fileInput) return alert("파일을 업로드해주세요.");
+
+        showLoading(true);
+
+        try {
+            // 1. 텍스트 추출
+            document.getElementById('loadingText').innerText = "파일에서 텍스트 추출 중...";
+            extractedText = await extractTextFromFile(fileInput);
+            
+            if (!extractedText || extractedText.length < 10) {
+                throw new Error("텍스트를 추출할 수 없거나 내용이 너무 짧습니다.");
+            }
+
+            // 2. 퀴즈 생성 요청
+            document.getElementById('loadingText').innerText = "AI가 퀴즈를 생성 중입니다...";
+            await generateQuiz(apiKey, extractedText);
+
+        } catch (error) {
+            alert("오류 발생: " + error.message);
+            showLoading(false);
+        }
+    }
+
+    // 파일별 텍스트 추출 로직
+    async function extractTextFromFile(file) {
+        const ext = file.name.split('.').pop().toLowerCase();
+        
+        if (ext === 'txt') {
+            return await file.text();
+        } else if (ext === 'pdf') {
+            return await extractFromPDF(file);
+        } else if (ext === 'pptx') {
+            return await extractFromPPTX(file);
+        } else {
+            throw new Error("지원하지 않는 파일 형식입니다.");
+        }
+    }
+
+    // PDF 텍스트 추출
+    async function extractFromPDF(file) {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+        let fullText = "";
+        
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map(item => item.str).join(" ");
+            fullText += pageText + "\n";
+        }
+        return fullText;
+    }
+
+    // PPTX 텍스트 추출 (JSZip 활용)
+    async function extractFromPPTX(file) {
+        const zip = new JSZip();
+        const loadedZip = await zip.loadAsync(file);
+        let fullText = "";
+
+        // ppt/slides/slide*.xml 파일들만 찾아서 텍스트 추출
+        for (const filename in loadedZip.files) {
+            if (filename.match(/ppt\/slides\/slide\d+\.xml/)) {
+                const xmlText = await loadedZip.files[filename].async("string");
+                // XML 태그 제거하고 텍스트만 남김 (간이 파싱)
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+                const textNodes = xmlDoc.getElementsByTagName("a:t");
+                for (let i = 0; i < textNodes.length; i++) {
+                    fullText += textNodes[i].textContent + " ";
+                }
+                fullText += "\n";
+            }
+        }
+        return fullText;
+    }
+
+    // Gemini API 호출 및 퀴즈 생성
+    async function generateQuiz(apiKey, context) {
+        const prompt = `
+        당신은 교사입니다. 다음 내용을 바탕으로 4지 선다형 퀴즈 5문제를 만드세요.
+        반드시 아래 포맷의 JSON Array로만 응답하세요. (마크다운 없이 순수 JSON만)
+        
+        [
+            {
+                "question": "문제 내용",
+                "options": ["보기1", "보기2", "보기3", "보기4"],
+                "answer": "정답보기내용",
+                "explanation": "해설"
+            }
+        ]
+
+        [학습 내용]:
+        ${context.substring(0, 15000)}
+        `;
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+        
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }]
+            })
+        });
+
+        const data = await response.json();
+        
+        if (data.error) throw new Error(data.error.message);
+
+        let rawText = data.candidates[0].content.parts[0].text;
+        // 마크다운 코드블록 제거
+        rawText = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+        
+        globalQuizData = JSON.parse(rawText);
+        renderQuizList();
+        showLoading(false);
+    }
+
+    // 개별 문제 재생성 (Regenerate)
+    async function regenerateOne(index) {
+        const apiKey = document.getElementById('apiKey').value;
+        if(!confirm("이 문제를 새로 만드시겠습니까?")) return;
+
+        const btn = document.getElementById(`regenBtn-${index}`);
+        const originalText = btn.innerHTML;
+        btn.innerHTML = `<span class="spinner-border spinner-border-sm"></span>`;
+        
+        try {
+            const prompt = `
+            다음 학습 내용을 바탕으로 새로운 4지 선다형 문제 1개를 만드세요.
+            반드시 다음 JSON 객체 형식으로 반환하세요: {"question": "...", "options": [...], "answer": "...", "explanation": "..."}
+            
+            [학습 내용]: ${extractedText.substring(0, 5000)}
+            `;
+
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+            });
+
+            const data = await response.json();
+            let rawText = data.candidates[0].content.parts[0].text;
+            rawText = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+            const newQuestion = JSON.parse(rawText);
+            
+            // 리스트인지 객체인지 판별하여 할당
+            if(Array.isArray(newQuestion)) globalQuizData[index] = newQuestion[0];
+            else globalQuizData[index] = newQuestion;
+
+            renderQuizList(); // 다시 그리기
+
+        } catch(e) {
+            alert("재생성 실패: " + e.message);
+            btn.innerHTML = originalText;
+        }
+    }
+
+    // 퀴즈 삭제
+    function deleteOne(index) {
+        if(confirm("이 문제를 삭제하시겠습니까?")) {
+            globalQuizData.splice(index, 1);
+            renderQuizList();
+        }
+    }
+
+    // 화면 렌더링
+    function renderQuizList() {
+        const container = document.getElementById('quizList');
+        container.innerHTML = "";
+        document.getElementById('resultArea').style.display = 'block';
+
+        globalQuizData.forEach((q, idx) => {
+            const card = document.createElement('div');
+            card.className = 'quiz-card';
+            card.innerHTML = `
+                <div class="d-flex justify-content-between">
+                    <h5>Q${idx + 1}. ${q.question}</h5>
+                    <div>
+                        <button id="regenBtn-${idx}" onclick="regenerateOne(${idx})" class="btn btn-outline-primary btn-sm me-1" title="재생성"><i class="bi bi-arrow-clockwise"></i></button>
+                        <button onclick="deleteOne(${idx})" class="btn btn-outline-danger btn-sm" title="삭제"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+                <ul class="list-group list-group-flush my-3">
+                    ${q.options.map((opt, i) => `<li class="list-group-item">${i+1}) ${opt}</li>`).join('')}
+                </ul>
+                <button class="btn btn-sm btn-info text-white" onclick="toggleAnswer(${idx})">정답 및 해설 보기</button>
+                <div id="ans-${idx}" class="answer-box">
+                    <strong>정답:</strong> ${q.answer}<br>
+                    <strong>해설:</strong> ${q.explanation}
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    function toggleAnswer(idx) {
+        const el = document.getElementById(`ans-${idx}`);
+        el.style.display = el.style.display === 'block' ? 'none' : 'block';
+    }
+
+    function showLoading(show) {
+        document.getElementById('loading').style.display = show ? 'block' : 'none';
+        document.getElementById('resultArea').style.display = show ? 'none' : (globalQuizData.length > 0 ? 'block' : 'none');
+    }
+
+    // CSV 다운로드 (한글 깨짐 방지 BOM 추가)
+    function downloadCSV() {
+        if (globalQuizData.length === 0) return;
+        
+        let csvContent = "\uFEFF번호,문제,보기1,보기2,보기3,보기4,정답,해설\n";
+        
+        globalQuizData.forEach((q, idx) => {
+            // CSV 포맷에 맞게 따옴표 처리
+            const clean = (text) => `"${String(text).replace(/"/g, '""')}"`;
+            
+            const row = [
+                idx + 1,
+                clean(q.question),
+                clean(q.options[0] || ""),
+                clean(q.options[1] || ""),
+                clean(q.options[2] || ""),
+                clean(q.options[3] || ""),
+                clean(q.answer),
+                clean(q.explanation)
+            ];
+            csvContent += row.join(",") + "\n";
+        });
+
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", "generated_quiz.csv");
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+</script>
+</body>
+</html>
